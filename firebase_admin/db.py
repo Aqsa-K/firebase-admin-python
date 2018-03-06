@@ -13,7 +13,6 @@
 # limitations under the License.
 
 """Firebase Realtime Database module.
-
 This module contains functions and classes that facilitate interacting with the Firebase Realtime
 Database. It supports basic data manipulation operations, as well as complex queries such as
 limit queries and range queries. However, it does not support realtime update notifications. This
@@ -24,14 +23,25 @@ import collections
 import json
 import sys
 
+from google.auth import transport
 import requests
 import six
 from six.moves import urllib
 
 import firebase_admin
-from firebase_admin import _http_client
 from firebase_admin import _utils
+from firebase_admin import _http_client
 
+from sseclient import SSEClient
+import socket
+import threading
+import time
+from requests import Session
+
+try:
+    from urllib.parse import urlencode, quote
+except:
+    from urllib import urlencode, quote
 
 _DB_ATTRIBUTE = '_database'
 _INVALID_PATH_CHARACTERS = '[].#$'
@@ -43,16 +53,12 @@ _TRANSACTION_MAX_RETRIES = 25
 
 def reference(path='/', app=None):
     """Returns a database Reference representing the node at the specified path.
-
     If no path is specified, this function returns a Reference that represents the database root.
-
     Args:
       path: Path to a node in the Firebase realtime database (optional).
       app: An App instance (optional).
-
     Returns:
       Reference: A newly initialized Reference.
-
     Raises:
       ValueError: If the specified path or app is invalid.
     """
@@ -68,13 +74,82 @@ def _parse_path(path):
             'Invalid path: "{0}". Path contains illegal characters.'.format(path))
     return [seg for seg in path.split('/') if seg]
 
+class KeepAuthSession(Session):
+    """
+    A session that doesn't drop Authentication on redirects between domains.
+    """
+
+    def rebuild_auth(self, prepared_request, response):
+        pass
+
+class ClosableSSEClient(SSEClient):
+    def __init__(self, *args, **kwargs):
+        self.should_connect = True
+        super(ClosableSSEClient, self).__init__(*args, **kwargs)
+
+    def _connect(self):
+        if self.should_connect:
+            success = False
+            while(success != True):
+                super(ClosableSSEClient, self)._connect()
+                success = True
+        else:
+            raise StopIteration()
+
+    def close(self):
+        self.should_connect = False
+        self.retry = 0
+        self.resp.raw._fp.fp.raw._sock.shutdown(socket.SHUT_RDWR)
+        self.resp.raw._fp.fp.raw._sock.close()
+
+class Stream:
+
+    def __init__(self, url, stream_handler, build_headers, stream_id):
+        self.build_headers = build_headers
+        self.url = url
+        self.stream_handler = stream_handler
+        self.stream_id = stream_id
+        self.sse = None
+        self.thread = None
+        self.start()
+
+    def make_session(self):
+        """
+        Return a custom session object to be passed to the ClosableSSEClient.
+        """
+        session = KeepAuthSession()
+        return session
+
+    def start(self):
+        self.thread = threading.Thread(target=self.start_stream)
+        self.thread.start()
+        return self
+
+    def start_stream(self):
+        self.sse = ClosableSSEClient(self.url, session=self.make_session(), build_headers=self.build_headers)
+
+        for msg in self.sse:
+            if msg:
+                msg_data = json.loads(msg.data)
+                msg_data["event"] = msg.event
+                if self.stream_id:
+                    msg_data["stream_id"] = self.stream_id
+                self.stream_handler(msg_data)
+
+    def close(self):
+        while not self.sse and not hasattr(self.sse, 'resp'):
+            time.sleep(0.001)
+        self.sse.running = False
+        self.sse.close()
+        self.thread.join()
+        return self
+
 
 class Reference(object):
     """Reference represents a node in the Firebase realtime database."""
 
     def __init__(self, **kwargs):
         """Creates a new Reference using the provided parameters.
-
         This method is for internal use only. Use db.reference() to obtain an instance of
         Reference.
         """
@@ -101,18 +176,30 @@ class Reference(object):
             return Reference(client=self._client, segments=self._segments[:-1])
         return None
 
+
+    def build_headers(self, token=None):
+        headers = {"content-type": "application/json; charset=UTF-8"}
+        if not token and self._client._session.credentials:
+            request = transport.requests.Request()
+            self._client._session.credentials.refresh(request)
+            access_token = self._client._session.credentials.token
+            headers['Authorization'] = 'Bearer ' + access_token
+        return headers
+
+    def stream(self, stream_handler, token=None, stream_id=None):
+        parameters = {}
+        # reset path and build_query for next query
+        request_ref = '{0}{1}.json?{2}'.format(self._client.base_url, self._pathurl, urlencode(parameters))
+        return Stream(request_ref, stream_handler, self.build_headers, stream_id)
+
     def child(self, path):
         """Returns a Reference to the specified child node.
-
         The path may point to an immediate child of the current Reference, or a deeply nested
         child. Child paths must not begin with '/'.
-
         Args:
           path: Path to the child node.
-
         Returns:
           Reference: A database Reference representing the specified child node.
-
         Raises:
           ValueError: If the child path is not a string, not well-formed or begins with '/'.
         """
@@ -127,18 +214,15 @@ class Reference(object):
 
     def get(self, etag=False, shallow=False):
         """Returns the value, and optionally the ETag, at the current location of the database.
-
         Args:
           etag: A boolean indicating whether the Etag value should be returned or not (optional).
           shallow: A boolean indicating whether to execute a shallow read (optional). Shallow
               reads do not retrieve the child nodes of the current database location. Cannot be
               set to True if ``etag`` is also set to True.
-
         Returns:
           object: If etag is False returns the decoded JSON value of the current database location.
           If etag is True, returns a 2-tuple consisting of the decoded JSON value and the Etag
           associated with the current database location.
-
         Raises:
           ValueError: If both ``etag`` and ``shallow`` are set to True.
           ApiCallError: If an error occurs while communicating with the remote database server.
@@ -155,17 +239,14 @@ class Reference(object):
 
     def get_if_changed(self, etag):
         """Gets data in this location only if the specified ETag does not match.
-
         Args:
           etag: The ETag value to be checked against the ETag of the current location.
-
         Returns:
           tuple: A 3-tuple consisting of a boolean, a decoded JSON value and an ETag. If the ETag
           specified by the caller did not match, the boolen value will be True and the JSON
           and ETag values would reflect the corresponding values in the database. If the ETag
           matched, the boolean value will be False and the other elements of the tuple will be
           None.
-
         Raises:
           ValueError: If the ETag is not a string.
           ApiCallError: If an error occurs while communicating with the remote database server.
@@ -181,12 +262,9 @@ class Reference(object):
 
     def set(self, value):
         """Sets the data at this location to the given value.
-
         The value must be JSON-serializable and not None.
-
         Args:
           value: JSON-serializable value to be set at this location.
-
         Raises:
           ValueError: If the provided value is None.
           TypeError: If the value is not JSON-serializable.
@@ -198,19 +276,15 @@ class Reference(object):
 
     def set_if_unchanged(self, expected_etag, value):
         """Conditonally sets the data at this location to the given value.
-
         Sets the data at this location to the given value only if ``expected_etag`` is same as the
         ETag value in the database.
-
         Args:
           expected_etag: Value of ETag we want to check.
           value: JSON-serializable value to be set at this location.
-
         Returns:
           tuple: A 3-tuple consisting of a boolean, a decoded JSON value and an ETag. The boolean
           indicates whether the set operation was successful or not. The decoded JSON and the
           ETag corresponds to the latest value in this database location.
-
         Raises:
           ValueError: If the value is None, or if expected_etag is not a string.
           ApiCallError: If an error occurs while communicating with the remote database server.
@@ -236,16 +310,12 @@ class Reference(object):
 
     def push(self, value=''):
         """Creates a new child node.
-
         The optional value argument can be used to provide an initial value for the child node. If
         no value is provided, child node will have empty string as the default value.
-
         Args:
           value: JSON-serializable initial value for the child node (optional).
-
         Returns:
           Reference: A Reference representing the newly created child node.
-
         Raises:
           ValueError: If the value is None.
           TypeError: If the value is not JSON-serializable.
@@ -259,10 +329,8 @@ class Reference(object):
 
     def update(self, value):
         """Updates the specified child keys of this Reference to the provided values.
-
         Args:
           value: A dictionary containing the child keys to update, and their new values.
-
         Raises:
           ValueError: If value is empty or not a dictionary.
           ApiCallError: If an error occurs while communicating with the remote database server.
@@ -275,7 +343,6 @@ class Reference(object):
 
     def delete(self):
         """Deletes this node from the database.
-
         Raises:
           ApiCallError: If an error occurs while communicating with the remote database server.
         """
@@ -283,11 +350,9 @@ class Reference(object):
 
     def transaction(self, transaction_update):
         """Atomically modifies the data at this location.
-
         Unlike a normal `set()`, which just overwrites the data regardless of its previous state,
         `transaction()` is used to modify the existing value to a new value, ensuring there are
         no conflicts with other clients simultaneously writing to the same location.
-
         This is accomplished by passing an update function which is used to transform the current
         value of this reference into a new value. If another client writes to this location before
         the new value is successfully saved, the update function is called again with the new
@@ -295,17 +360,14 @@ class Reference(object):
         will retry the transaction up to 25 times before giving up and raising a TransactionError.
         The update function may also force an early abort by raising an exception instead of
         returning a value.
-
         Args:
           transaction_update: A function which will be passed the current data stored at this
               location. The function should return the new value it would like written. If
               an exception is raised, the transaction will be aborted, and the data at this
               location will not be modified. The exceptions raised by this function are
               propagated to the caller of the transaction method.
-
         Returns:
           object: New value of the current database Reference (only if the transaction commits).
-
         Raises:
           TransactionError: If the transaction aborts after exhausting all retry attempts.
           ValueError: If transaction_update is not a function.
@@ -325,16 +387,12 @@ class Reference(object):
 
     def order_by_child(self, path):
         """Returns a Query that orders data by child values.
-
         Returned Query can be used to set additional parameters, and execute complex database
         queries (e.g. limit queries, range queries).
-
         Args:
           path: Path to a valid child of the current Reference.
-
         Returns:
           Query: A database Query instance.
-
         Raises:
           ValueError: If the child path is not a string, not well-formed or None.
         """
@@ -344,10 +402,8 @@ class Reference(object):
 
     def order_by_key(self):
         """Creates a Query that orderes data by key.
-
         Returned Query can be used to set additional parameters, and execute complex database
         queries (e.g. limit queries, range queries).
-
         Returns:
           Query: A database Query instance.
         """
@@ -355,10 +411,8 @@ class Reference(object):
 
     def order_by_value(self):
         """Creates a Query that orderes data by value.
-
         Returned Query can be used to set additional parameters, and execute complex database
         queries (e.g. limit queries, range queries).
-
         Returns:
           Query: A database Query instance.
         """
@@ -370,7 +424,6 @@ class Reference(object):
 
 class Query(object):
     """Represents a complex query that can be executed on a Reference.
-
     Complex queries can consist of up to 2 components: a required ordering constraint, and an
     optional filtering constraint. At the server, data is first sorted according to the given
     ordering constraint (e.g. order by child). Then the filtering constraint (e.g. limit, range)
@@ -400,13 +453,10 @@ class Query(object):
 
     def limit_to_first(self, limit):
         """Creates a query with limit, and anchors it to the start of the window.
-
         Args:
           limit: The maximum number of child nodes to return.
-
         Returns:
           Query: The updated Query instance.
-
         Raises:
           ValueError: If the value is not an integer, or set_limit_last() was called previously.
         """
@@ -419,13 +469,10 @@ class Query(object):
 
     def limit_to_last(self, limit):
         """Creates a query with limit, and anchors it to the end of the window.
-
         Args:
           limit: The maximum number of child nodes to return.
-
         Returns:
           Query: The updated Query instance.
-
         Raises:
           ValueError: If the value is not an integer, or set_limit_first() was called previously.
         """
@@ -438,16 +485,12 @@ class Query(object):
 
     def start_at(self, start):
         """Sets the lower bound for a range query.
-
         The Query will only return child nodes with a value greater than or equal to the specified
         value.
-
         Args:
           start: JSON-serializable value to start at, inclusive.
-
         Returns:
           Query: The updated Query instance.
-
         Raises:
           ValueError: If the value is ``None``.
         """
@@ -458,16 +501,12 @@ class Query(object):
 
     def end_at(self, end):
         """Sets the upper bound for a range query.
-
         The Query will only return child nodes with a value less than or equal to the specified
         value.
-
         Args:
           end: JSON-serializable value to end at, inclusive.
-
         Returns:
           Query: The updated Query instance.
-
         Raises:
           ValueError: If the value is ``None``.
         """
@@ -478,15 +517,11 @@ class Query(object):
 
     def equal_to(self, value):
         """Sets an equals constraint on the Query.
-
         The Query will only return child nodes whose value is equal to the specified value.
-
         Args:
           value: JSON-serializable value to query for.
-
         Returns:
           Query: The updated Query instance.
-
         Raises:
           ValueError: If the value is ``None``.
         """
@@ -504,12 +539,9 @@ class Query(object):
 
     def get(self):
         """Executes this Query and returns the results.
-
         The results will be returned as a sorted list or an OrderedDict.
-
         Returns:
           object: Decoded JSON result of the Query.
-
         Raises:
           ApiCallError: If an error occurs while communicating with the remote database server.
         """
@@ -596,7 +628,6 @@ class _SortEntry(object):
     @classmethod
     def _get_index_type(cls, index):
         """Assigns an integer code to the type of the index.
-
         The index type determines how differently typed values are sorted. This ordering is based
         on https://firebase.google.com/docs/database/rest/retrieve-data#section-rest-ordered-data
         """
@@ -626,7 +657,6 @@ class _SortEntry(object):
 
     def _compare(self, other):
         """Compares two _SortEntry instances.
-
         If the indices have the same numeric or string type, compare them directly. Ties are
         broken by comparing the keys. If the indices have the same type, but are neither numeric
         nor string, compare the keys. In all other cases compare based on the ordering provided
@@ -664,7 +694,6 @@ class _SortEntry(object):
 
 class _Client(_http_client.JsonHttpClient):
     """HTTP client used to make REST calls.
-
     _Client maintains an HTTP session, and handles authenticating HTTP requests along with
     marshalling and unmarshalling of JSON data.
     """
@@ -673,10 +702,8 @@ class _Client(_http_client.JsonHttpClient):
 
     def __init__(self, credential, base_url, auth_override=_DEFAULT_AUTH_OVERRIDE, timeout=None):
         """Creates a new _Client from the given parameters.
-
         This exists primarily to enable testing. For regular use, obtain _Client instances by
         calling the from_app() class method.
-
         Args:
           credential: A Google credential that can be used to authenticate requests.
           base_url: A URL prefix to be added to all outgoing requests. This is typically the
@@ -745,19 +772,15 @@ class _Client(_http_client.JsonHttpClient):
 
     def request(self, method, url, **kwargs):
         """Makes an HTTP call using the Python requests library.
-
         Extends the request() method of the parent JsonHttpClient class. Handles auth overrides,
         and low-level exceptions.
-
         Args:
           method: HTTP method name as a string (e.g. get, post).
           url: URL path of the remote endpoint. This will be appended to the server's base URL.
           kwargs: An additional set of keyword arguments to be passed into requests API
               (e.g. json, params).
-
         Returns:
           Response: An HTTP response object.
-
         Raises:
           ApiCallError: If an error occurs while making the HTTP call.
         """
@@ -777,16 +800,13 @@ class _Client(_http_client.JsonHttpClient):
 
     def _extract_error_message(self, error):
         """Extracts an error message from an exception.
-
         If the server has not sent any response, simply converts the exception into a string.
         If the server has sent a JSON response with an 'error' field, which is the typical
         behavior of the Realtime Database REST API, parses the response to retrieve the error
         message. If the server has sent a non-JSON response, returns the full response
         as the error message.
-
         Args:
           error: An exception raised by the requests library.
-
         Returns:
           str: A string error message extracted from the exception.
         """
