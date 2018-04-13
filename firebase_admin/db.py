@@ -32,7 +32,7 @@ import firebase_admin
 from firebase_admin import _utils
 from firebase_admin import _http_client
 
-from sseclient import SSEClient
+from firebase_admin.sseclient import SSEClient
 import socket
 import threading
 import time
